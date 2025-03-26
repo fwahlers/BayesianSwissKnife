@@ -61,7 +61,7 @@ class CountryDataLoader:
                 # Ensure datetime column exists and is datetime type
                 if "eom" not in df.columns:
                     raise ValueError(f"Missing 'eom' column in {file}")
-                df["eom"] = pd.to_datetime(df["eom"])
+                df["eom"] = pd.to_datetime(df["eom"], format="%Y%m%d")
 
                 # Standardize all non-date columns
                 if self.standardize:

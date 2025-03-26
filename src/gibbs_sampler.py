@@ -1,8 +1,10 @@
 import numpy as np
+import pandas as pd
 from typing import Dict, List
 from numpy.linalg import inv
-from scipy.stats import invgamma, wishart, multivariate_normal
+from scipy.stats import invgamma, gamma, wishart, multivariate_normal
 from tqdm import trange
+import os
 
 
 class HierarchicalGibbsSampler:
@@ -19,12 +21,8 @@ class HierarchicalGibbsSampler:
         beta_sigma: float = 1.0,
         hyper_type: str = "gamma",  # or "wishart"
         burn_in: int = 0,
-
-        # 🔹 Gamma prior for Λ_c = τ² I_p
         alpha_lambda: float = 2.0,
         beta_lambda: float = 1.0,
-
-        # 🔹 Wishart prior for full Λ_c
         Sigma: np.ndarray = None,
         nu: float = None
     ):
@@ -55,16 +53,6 @@ class HierarchicalGibbsSampler:
         # Initialize σ² to a reasonable value
         self.sigma2 = 1.0
 
-        # Initialize Λ_c based on hyper_type
-        if self.hyper_type == "gamma":
-            # Use small τ² * I_p
-            init_tau2 = 1.0
-            self.Lambda = {c: init_tau2 * np.eye(self.p) for c in X_dict}
-
-        elif self.hyper_type == "wishart":
-            # Use Wishart scale prior directly (from __init__ args)
-            self.Lambda = {c: np.copy(self.Sigma) for c in X_dict}
-
 
         # Global prior on θ_g
         self.tau_theta_g_sq = tau_theta_g_sq
@@ -73,13 +61,13 @@ class HierarchicalGibbsSampler:
         self.alpha_sigma = alpha_sigma
         self.beta_sigma = beta_sigma
 
-        # 🔹 Gamma hyperparameters
+        # Gamma hyperparameters
         self.alpha_lambda = alpha_lambda
         self.beta_lambda = beta_lambda
 
-        # 🔹 Wishart hyperparameters
+        # Wishart hyperparameters
         self.Sigma = Sigma if Sigma is not None else np.eye(self.p)
-        self.Sigma_inv = np.linalg.inv(self.Sigma)
+        self.Sigma_inv = inv(self.Sigma)
         self.nu = nu if nu is not None else self.p + 2  # just a safe default
 
         # Store samples
@@ -87,24 +75,23 @@ class HierarchicalGibbsSampler:
         self.theta_l_samples = []
         self.sigma2_samples = []
         self.Lambda_samples = []
+
+        # Initialize Λ_c based on hyper_type
+        if self.hyper_type == "gamma":
+        # Use small τ² * I_p
+            init_tau2 = 1.0
+            self.Lambda = {c: init_tau2 * np.eye(self.p) for c in X_dict}
+        elif self.hyper_type == "wishart":
+        # Use Wishart scale prior directly (from __init__ args)
+            self.Lambda = {c: np.copy(self.Sigma) for c in X_dict}
         
-        # Initialize parameters
-        min_norm_sq = 2 / self.beta_lambda
-        target_norm = np.sqrt(min_norm_sq + 1e-4)  # small buffer above threshold
-        # Ensure: θᵀθ > 2 / β  →  set θ_l = unit vector * √(target norm)
-        min_norm_sq = 2 / self.beta_lambda
-        target_norm = np.sqrt(min_norm_sq + 1e-4)  # small buffer above threshold
 
-        def make_safe_theta(p, target_norm):
-            v = np.random.normal(0, 1, size=p)
-            v /= np.linalg.norm(v)
-            return v * target_norm
-
-        self.theta_g = make_safe_theta(self.p, target_norm)
+        self.theta_g = np.random.normal(0, 1, size=self.p)
         self.theta_l = {
-            c: make_safe_theta(self.p, target_norm)
-            for c in X_dict
+            c: np.random.normal(0, 1, size=self.p)
+            for c in self.X_dict
         }
+
 
 
     def sample_global_parameters(self):
@@ -123,7 +110,7 @@ class HierarchicalGibbsSampler:
             b += X_c.T @ (Y_c - X_c @ theta_l_c)
 
         A = (1 / sigma2) * A + tau_sq_inv * np.eye(self.p)
-        A_inv = np.linalg.inv(A)
+        A_inv = inv(A)
 
         g = A_inv @ b
 
@@ -141,7 +128,7 @@ class HierarchicalGibbsSampler:
 
             XtX = X_c.T @ X_c
             B_c = (1 / sigma2) * XtX + Lambda_c
-            B_c_inv = np.linalg.inv(B_c)
+            B_c_inv = inv(B_c)
 
             residual = Y_c - X_c @ self.theta_g
             d_c = B_c_inv @ (X_c.T @ residual)
@@ -158,7 +145,7 @@ class HierarchicalGibbsSampler:
 
     def sample_variance(self):
         """
-        Samples sigma^2 ~ InvGamma(α + n/2, β + 0.5 * rᵀr),
+        Samples sigma^2 ~ Gamma(alpha_sigma,(1/2 r'r + 1/beta_sigma)^-1),
         where r = Y - X θ_g - Z θ_ℓ
         """
         # Stack all local θ_ℓ into one vector
@@ -167,10 +154,10 @@ class HierarchicalGibbsSampler:
         r = self.Y - self.X @ self.theta_g - self.Z @ self.theta_l_vector
         rss = r.T @ r
 
-        alpha_post = self.alpha_sigma + 0.5 * len(self.Y)
-        beta_post = self.beta_sigma + 0.5 * rss
+        alpha_cond = self.alpha_sigma 
+        beta_cond = (1/self.beta_sigma + rss) 
 
-        self.sigma2 = invgamma.rvs(a=alpha_post, scale=beta_post)
+        self.sigma2 = invgamma.rvs(a=alpha_cond, scale=(1/beta_cond))
         self.sigma2_samples.append(self.sigma2)
 
     def sample_hyperparameters(self):
@@ -186,8 +173,7 @@ class HierarchicalGibbsSampler:
 
             if self.hyper_type == "gamma":
                 shape = self.alpha_lambda + self.p
-                rate = self.beta_lambda + 0.5 * theta_l_c.T @ theta_l_c
-                scale = 1 / rate
+                scale = 1 / (0.5 * theta_l_c.T @ theta_l_c + 1/self.beta_lambda)
 
                 tau2 = np.random.gamma(shape=shape, scale=scale)
                 self.Lambda[c] = tau2 * np.eye(self.p)
@@ -203,11 +189,14 @@ class HierarchicalGibbsSampler:
 
         self.Lambda_samples.append({c: self.Lambda[c].copy() for c in self.X_dict})
 
-    def run(self, verbose: bool = True):
+    def run(self, verbose: bool = True, save_path: str = "./"):
         """
         Runs the full Gibbs sampler for `n_iter` iterations.
-        Stores each sampled parameter in respective lists.
+        Writes to .parquet every 1000 iterations.
         """
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
         iterator = trange(self.n_iter) if verbose else range(self.n_iter)
 
         for n in iterator:
@@ -215,12 +204,33 @@ class HierarchicalGibbsSampler:
             self.sample_local_parameters()
             self.sample_variance()
             self.sample_hyperparameters()
-            # After theta_g and theta_l have been sampled
+
+            # Save G_c at this iteration
             norm_g = np.linalg.norm(self.theta_g)
             for c in self.X_dict:
                 norm_l = np.linalg.norm(self.theta_l[c])
-                Gc = norm_g / (norm_g + norm_l + 1e-10)  # epsilon to avoid division by zero
+                Gc = norm_g / (norm_g + norm_l + 1e-10)
                 self.Gc_trace[c].append(Gc)
+
+            # Save every 1000 iterations
+            if (n + 1) % 1000 == 0 or (n + 1) == self.n_iter:
+                # θ_g samples
+                pd.DataFrame(self.theta_g_samples).to_parquet(
+                    f"{save_path}/theta_g_samples.parquet", index=False
+                )
+
+                # θ_l samples
+                df_theta_l = pd.DataFrame([
+                    {f"{c}_{i}": sample[c][i] for c in sample for i in range(len(sample[c]))}
+                    for sample in self.theta_l_samples
+                ])
+                df_theta_l.to_parquet(f"{save_path}/theta_l_samples.parquet", index=False)
+
+                # G_c trace
+                pd.DataFrame(self.Gc_trace).to_parquet(
+                    f"{save_path}/Gc_trace.parquet", index=False
+            )
+
 
 
     def get_posterior_samples(self):
