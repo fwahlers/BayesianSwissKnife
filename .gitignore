@@ -8,3 +8,4 @@ gitpass
 gitpass.pub
 theta_l_samples.csv
 src/theta_l_samples.csv
+src/*.parquet
