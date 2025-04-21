@@ -1,15 +1,15 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List
+from typing import Dict
 from numpy.linalg import inv
-from scipy.stats import invgamma, gamma, wishart, multivariate_normal
 from tqdm import trange
+from scipy.stats import wishart, invgamma
 import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from typing import Optional, Union, List, Dict
+from typing import Optional, Dict
 
 
 
@@ -38,8 +38,10 @@ class HierarchicalGibbsSampler:
             Y_dict: country → Y_c vector
             n_iter: number of Gibbs iterations
             tau_theta_g_sq: prior variance for theta_g
-            alpha_sigma, beta_sigma: inverse gamma prior for variance
+            alpha_sigma, beta_sigma: gamma prior for variance(through tau)
             hyper_type: choose between "gamma" and "wishart"
+            burn_in: burn_in period, pretty useless in the new version(will be removed)
+            alpha_lbamda, beta_lambda: 
         """
 
         # Save all inputs
@@ -52,7 +54,7 @@ class HierarchicalGibbsSampler:
         self.burn_in = burn_in
         self.hyper_type = hyper_type
         self.Gc_trace = {c: [] for c in self.X_dict} 
-
+        self.N = self.Y.shape[0]
         self.p = list(X_dict.values())[0].shape[1]
         self.C = len(X_dict)
 
@@ -70,7 +72,6 @@ class HierarchicalGibbsSampler:
 
         # Wishart hyperparameters
         self.Sigma = Sigma if Sigma is not None else np.eye(self.p)
-        self.Sigma_inv = inv(self.Sigma)
         self.nu = nu if nu is not None else self.p + 2  # just a safe default
 
         # Store samples
@@ -81,11 +82,9 @@ class HierarchicalGibbsSampler:
 
         # Initialize Λ_c based on hyper_type
         if self.hyper_type == "gamma":
-        # Use small τ² * I_p
             init_tau2 = alpha_lambda * beta_lambda
             self.Lambda = {c: init_tau2 * np.eye(self.p) for c in X_dict}
         elif self.hyper_type == "wishart":
-        # Use Wishart scale prior directly 
             self.Lambda = {c: np.copy(self.Sigma) for c in X_dict}
         
 
@@ -95,46 +94,59 @@ class HierarchicalGibbsSampler:
             for c in self.X_dict
         }
         # Initialize σ² to a reasonable value
-        self.sigma2 = 0.2
+        self.sigma2 = 0.5
 
 
     def sample_global_parameters(self):
-        sigma2 = self.sigma2
+        """
+        Samples theta_g ~ N(g, A^{-1}),
+        where
+        A = 1/sigma2(sum_c X_c'X_c) + 1/tau_theta_g *I_p
+        g = A^{-1}.(1/sigma2)*b
+        """
 
+        sigma2 = self.sigma2
+        tau_sq_inv = 1.0/self.tau_theta_g_sq
         A = np.zeros((self.p, self.p))
         b = np.zeros(self.p)
 
         for c in self.X_dict:
-            X_c = self.X_dict[c]     # shape: (n_c, p)
-            Y_c = self.Y_dict[c]     # shape: (n_c,)
+            X_c = self.X_dict[c]         # shape: (n_c, p)
+            Y_c = self.Y_dict[c]         # shape: (n_c,)
             theta_l_c = self.theta_l[c]  # shape: (p,)
 
             A += (X_c.T @ X_c)
-            b += X_c.T @ (Y_c - X_c @ theta_l_c)
+            b += (X_c.T @ (Y_c - X_c @ theta_l_c))
 
-        A = (1 / sigma2) * A + (1/self.tau_theta_g_sq) * np.eye(self.p)
+        A = (1.0 / sigma2) * A + tau_sq_inv * np.eye(self.p)
         A_inv = inv(A)
 
-        g = (A_inv*(1/sigma2)) @ b
+        g = A_inv @ ((1/sigma2)*b)
 
-        # Sample from N(g, A^{-1})
         self.theta_g = np.random.multivariate_normal(mean=g, cov=A_inv)
         self.theta_g_samples.append(self.theta_g)
 
     def sample_local_parameters(self):
-        sigma2 = self.sigma2
+        """
+        Samples theta_l ~ prod N(d_c, B_c^{-1}),
+        where
+        B_c = 1/sigma2 X_c'X_c + Lambda_c
+        d_c = B_c^{-1} * ((1/sigma2)*b)
+        """
 
+        sigma2 = self.sigma2
+        theta_g = self.theta_g
         for c in self.X_dict:
             X_c = self.X_dict[c]          # shape: (n_c, p)
             Y_c = self.Y_dict[c]          # shape: (n_c,)
             Lambda_c = self.Lambda[c]     # shape: (p, p)
 
             XtX = X_c.T @ X_c
-            B_c = (1 / sigma2) * XtX + Lambda_c
+            B_c = (1.0 / sigma2) * XtX + Lambda_c
             B_c_inv = inv(B_c)
 
-            residual = Y_c - X_c @ self.theta_g
-            d_c = B_c_inv @ (X_c.T @ residual)
+            b = X_c.T @ (Y_c - X_c @ theta_g)
+            d_c = B_c_inv @ ((1/sigma2)*b)
 
             self.theta_l[c] = np.random.multivariate_normal(mean=d_c, cov=B_c_inv)
 
@@ -148,18 +160,19 @@ class HierarchicalGibbsSampler:
 
     def sample_variance(self):
         """
-        Samples sigma^2 ~ Gamma(alpha_sigma,(1/2 r'r + 1/beta_sigma)^-1),
+        Samples tau^2 ~ Gamma(alpha_sigma,(1/2 r'r + 1/beta_sigma)^-1),
+        sigma^2 = 1/tau^2 
         where r = Y - X θ_g - Z θ_ℓ
         """
-
+        
         r = self.Y - self.X @ self.theta_g - self.Z @ self.theta_l_vector
-        rss = r.T @ r
+        rss = 0.5*r.T @ r
+        alpha_cond = self.alpha_sigma + self.N/2
+        beta_cond = (rss + 1/self.beta_sigma) 
 
-        alpha_cond = self.alpha_sigma 
-        beta_cond = 1/(0.5*rss + 1/self.beta_sigma) 
-
-        tau_sigma = gamma.rvs(a=alpha_cond, scale=beta_cond)
-        self.sigma2 = 1/tau_sigma
+        
+        tau2 = np.random.gamma(shape=alpha_cond, scale=1/beta_cond)
+        self.sigma2 = 1/tau2
         self.sigma2_samples.append(self.sigma2)
 
     def sample_hyperparameters(self):
@@ -175,17 +188,17 @@ class HierarchicalGibbsSampler:
 
             if self.hyper_type == "gamma":
                 alpha_cond = self.alpha_lambda + self.p
-                beta_cond = 1 / (0.5 * theta_l_c.T @ theta_l_c + 1/self.beta_lambda)
+                beta_cond = 1/(0.5 * theta_l_c.T @ theta_l_c + 1/self.beta_lambda)
 
                 tau2 = np.random.gamma(shape=alpha_cond, scale=beta_cond)
                 self.Lambda[c] = tau2 * np.eye(self.p)
 
 
             elif self.hyper_type == "wishart":
-                
                 V = inv(self.Sigma) + theta_l_c @ theta_l_c.T
+                inv_V = inv(V)
                 df = self.nu + 1
-                self.Lambda[c] = wishart.rvs(df=df, scale=inv(V))
+                self.Lambda[c] = wishart.rvs(df=df, scale=inv_V)
 
             else:
                 raise ValueError(f"Unknown hyper_type: {self.hyper_type}")
@@ -207,12 +220,12 @@ class HierarchicalGibbsSampler:
             self.sample_local_parameters()
             self.sample_variance()
             self.sample_hyperparameters()
-
+       
             # Save G_c at this iteration
             norm_g = np.linalg.norm(self.theta_g)
             for c in self.X_dict:
                 norm_l = np.linalg.norm(self.theta_l[c])
-                Gc = norm_g / (norm_g + norm_l + 1e-10)
+                Gc = norm_g / (norm_g + norm_l )
                 self.Gc_trace[c].append(Gc)
 
             # Save every 1000 iterations
@@ -231,7 +244,7 @@ class HierarchicalGibbsSampler:
 
                 # G_c trace
                 pd.DataFrame(self.Gc_trace).to_parquet(
-                    f"{save_path}/Gc_trace.parquet", index=False
+                    f"{save_path}/Gc_samples.parquet", index=False
             )
 
 

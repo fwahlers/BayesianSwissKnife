@@ -28,3 +28,6 @@ joblib                 # Optional: saving models or cached runs
 mypy                   # Static type checker
 black                  # Code formatter
 isort                  # Import sorter
+
+optuna
+scipy.sparse
