@@ -4,10 +4,14 @@ from typing import Dict
 from numpy.linalg import inv
 from tqdm import trange
 from scipy.stats import wishart, invgamma
+from scipy.linalg import cho_factor, cho_solve
 import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from typing import Optional, Dict
 
@@ -57,7 +61,7 @@ class HierarchicalGibbsSampler:
         self.N = self.Y.shape[0]
         self.p = list(X_dict.values())[0].shape[1]
         self.C = len(X_dict)
-
+        self.I = np.eye(self.p)
 
         # Global prior on θ_g
         self.tau_theta_g_sq = tau_theta_g_sq
@@ -71,7 +75,7 @@ class HierarchicalGibbsSampler:
         self.beta_lambda = beta_lambda
 
         # Wishart hyperparameters
-        self.Sigma = Sigma if Sigma is not None else np.eye(self.p)
+        self.Sigma = Sigma if Sigma is not None else self.I
         self.nu = nu if nu is not None else self.p + 2  # just a safe default
 
         # Store samples
@@ -83,7 +87,7 @@ class HierarchicalGibbsSampler:
         # Initialize Λ_c based on hyper_type
         if self.hyper_type == "gamma":
             init_tau2 = alpha_lambda * beta_lambda
-            self.Lambda = {c: init_tau2 * np.eye(self.p) for c in X_dict}
+            self.Lambda = {c: init_tau2 * self.I for c in X_dict}
         elif self.hyper_type == "wishart":
             self.Lambda = {c: np.copy(self.Sigma) for c in X_dict}
         
@@ -94,7 +98,14 @@ class HierarchicalGibbsSampler:
             for c in self.X_dict
         }
         # Initialize σ² to a reasonable value
-        self.sigma2 = 0.5
+        self.sigma2 = 1
+
+        ## Static calculations
+        self.XtX = {}
+        for c in self.X_dict:
+            X_c = X_dict[c]
+            self.XtX[c] = X_c.T @ X_c
+
 
 
     def sample_global_parameters(self):
@@ -114,46 +125,50 @@ class HierarchicalGibbsSampler:
             X_c = self.X_dict[c]         # shape: (n_c, p)
             Y_c = self.Y_dict[c]         # shape: (n_c,)
             theta_l_c = self.theta_l[c]  # shape: (p,)
+            XtX = self.XtX[c]
 
-            A += (X_c.T @ X_c)
+            A += XtX
             b += (X_c.T @ (Y_c - X_c @ theta_l_c))
 
-        A = (1.0 / sigma2) * A + tau_sq_inv * np.eye(self.p)
-        A_inv = inv(A)
+        A = (1.0 / sigma2) * A + tau_sq_inv * self.I
+        L, lower = cho_factor(A)
 
-        g = A_inv @ ((1/sigma2)*b)
+        A_inv = cho_solve((L, lower), np.eye(self.p))
+        g = A_inv @ ((1.0 / sigma2) * b)
 
+        # Sample
         self.theta_g = np.random.multivariate_normal(mean=g, cov=A_inv)
-        self.theta_g_samples.append(self.theta_g)
+        
 
     def sample_local_parameters(self):
-        """
-        Samples theta_l ~ prod N(d_c, B_c^{-1}),
-        where
-        B_c = 1/sigma2 X_c'X_c + Lambda_c
-        d_c = B_c^{-1} * ((1/sigma2)*b)
-        """
-
         sigma2 = self.sigma2
         theta_g = self.theta_g
-        for c in self.X_dict:
-            X_c = self.X_dict[c]          # shape: (n_c, p)
-            Y_c = self.Y_dict[c]          # shape: (n_c,)
-            Lambda_c = self.Lambda[c]     # shape: (p, p)
 
-            XtX = X_c.T @ X_c
+        def sample_one_country(c):
+            X_c = self.X_dict[c]
+            Y_c = self.Y_dict[c]
+            Lambda_c = self.Lambda[c]
+            XtX = self.XtX[c]
+
             B_c = (1.0 / sigma2) * XtX + Lambda_c
-            B_c_inv = inv(B_c)
+
+            L, lower = cho_factor(B_c)
+            B_c_inv = cho_solve((L, lower), np.eye(self.p))
 
             b = X_c.T @ (Y_c - X_c @ theta_g)
-            d_c = B_c_inv @ ((1/sigma2)*b)
+            d_c = B_c_inv @ ((1.0 / sigma2) * b)
 
-            self.theta_l[c] = np.random.multivariate_normal(mean=d_c, cov=B_c_inv)
+            theta_l_c = np.random.multivariate_normal(mean=d_c, cov=B_c_inv)
+            return c, theta_l_c
 
-        # Store a deep copy of the full set of theta_l's for this iteration
-        self.theta_l_samples.append({c: self.theta_l[c].copy() for c in self.X_dict})
+        with ThreadPoolExecutor() as executor:
+            results = executor.map(sample_one_country, self.X_dict)
 
-        # Stack all θ_ℓ into one global vector and store it for reuse
+        # Unpack results
+        for c, theta_l_c in results:
+            self.theta_l[c] = theta_l_c
+        
+
         self.theta_l_vector = np.concatenate([
             self.theta_l[c] for c in self.X_dict
         ])
@@ -166,14 +181,15 @@ class HierarchicalGibbsSampler:
         """
         
         r = self.Y - self.X @ self.theta_g - self.Z @ self.theta_l_vector
+
         rss = 0.5*r.T @ r
         alpha_cond = self.alpha_sigma + self.N/2
-        beta_cond = (rss + 1/self.beta_sigma) 
+        beta_cond = (rss + self.beta_sigma) 
 
         
         tau2 = np.random.gamma(shape=alpha_cond, scale=1/beta_cond)
         self.sigma2 = 1/tau2
-        self.sigma2_samples.append(self.sigma2)
+        
 
     def sample_hyperparameters(self):
         """
@@ -187,23 +203,23 @@ class HierarchicalGibbsSampler:
             theta_l_c = self.theta_l[c]
 
             if self.hyper_type == "gamma":
-                alpha_cond = self.alpha_lambda + self.p
-                beta_cond = 1/(0.5 * theta_l_c.T @ theta_l_c + 1/self.beta_lambda)
+                alpha_cond = self.alpha_lambda + self.p/2
+                beta_cond = 1/(0.5 * theta_l_c.T @ theta_l_c + self.beta_lambda)
 
                 tau2 = np.random.gamma(shape=alpha_cond, scale=beta_cond)
-                self.Lambda[c] = tau2 * np.eye(self.p)
+                self.Lambda[c] = tau2 * self.I
 
 
             elif self.hyper_type == "wishart":
                 V = inv(self.Sigma) + theta_l_c @ theta_l_c.T
                 inv_V = inv(V)
-                df = self.nu + 1
+                df = self.nu + self.N
                 self.Lambda[c] = wishart.rvs(df=df, scale=inv_V)
 
             else:
                 raise ValueError(f"Unknown hyper_type: {self.hyper_type}")
 
-        self.Lambda_samples.append({c: self.Lambda[c].copy() for c in self.X_dict})
+        
 
     def run(self, verbose: bool = True, save_path: str = "./"):
         """
@@ -214,38 +230,45 @@ class HierarchicalGibbsSampler:
             os.makedirs(save_path)
 
         iterator = trange(self.n_iter) if verbose else range(self.n_iter)
+        np.random.seed(42)  
 
         for n in iterator:
+            
             self.sample_global_parameters()
             self.sample_local_parameters()
             self.sample_variance()
             self.sample_hyperparameters()
-       
-            # Save G_c at this iteration
-            norm_g = np.linalg.norm(self.theta_g)
-            for c in self.X_dict:
-                norm_l = np.linalg.norm(self.theta_l[c])
-                Gc = norm_g / (norm_g + norm_l )
-                self.Gc_trace[c].append(Gc)
+            #print(self.theta_g[4])
+            print(self.sigma2)
+            #print(self.Lambda["usa"])
+            if n >= self.burn_in:
+                self.theta_g_samples.append(self.theta_g)
+                self.theta_l_samples.append({c: self.theta_l[c].copy() for c in self.X_dict})
+                self.sigma2_samples.append(self.sigma2)
+                self.Lambda_samples.append({c: self.Lambda[c].copy() for c in self.X_dict})
+                norm_g = np.linalg.norm(self.theta_g)
+                for c in self.X_dict:
+                    norm_l = np.linalg.norm(self.theta_l[c])
+                    Gc = norm_g / (norm_g + norm_l )
+                    self.Gc_trace[c].append(Gc)
 
             # Save every 1000 iterations
-            if (n + 1) % 1000 == 0 or (n + 1) == self.n_iter:
+            if n > self.burn_in and ((n + 1) % 1000 == 0 or (n +1) == self.n_iter):
                 # θ_g samples
                 pd.DataFrame(self.theta_g_samples).to_parquet(
                     f"{save_path}/theta_g_samples.parquet", index=False
                 )
-
-                # θ_l samples
-                df_theta_l = pd.DataFrame([
+                # θ_l samples	
+                pd.DataFrame([
                     {f"{c}_{i}": sample[c][i] for c in sample for i in range(len(sample[c]))}
                     for sample in self.theta_l_samples
-                ])
-                df_theta_l.to_parquet(f"{save_path}/theta_l_samples.parquet", index=False)
-
+                ]).to_parquet(f"{save_path}/theta_l_samples.parquet", index=False)
                 # G_c trace
-                pd.DataFrame(self.Gc_trace).to_parquet(
-                    f"{save_path}/Gc_samples.parquet", index=False
-            )
+                pd.DataFrame({c: vals for c, vals in self.Gc_trace.items()}).to_parquet(
+                f"{save_path}/Gc_samples.parquet", index=False)
+                pd.DataFrame(self.sigma2_samples, columns=["sigma2"]).to_parquet(
+                    f"{save_path}/sigma2.parquet", index=False)
+
 
 
 class PosteriorAnalyzer:
@@ -281,6 +304,14 @@ class PosteriorAnalyzer:
             c: self.get_theta_l_samples(c).mean(axis=0)
             for c in self.country_codes
         }
+    def get_theta_g_median(self) -> np.ndarray:
+        return np.median(self.theta_g,axis=0)
+    
+    def get_theta_l_median(self) -> Dict[str, np.ndarray]:
+        return {
+            c: np.median(self.get_theta_l_samples(c),axis=0)
+            for c in self.country_codes
+        }
 
 
     def get_Gc_posterior_mean(self) -> Optional[Dict[str, float]]:
@@ -295,8 +326,9 @@ class PosteriorAnalyzer:
         country: Optional[str] = None,
         bins: int = 50,
         clip: bool = True,
-        clip_bounds: tuple[float, float] = (1, 99)
-        ):
+        clip_bounds: tuple[float, float] = (1, 99),
+        ax: Optional[plt.Axes] = None
+    ):
         """
         Plot histogram for a specific feature index of θ_g or θ_l for a country.
 
@@ -307,6 +339,7 @@ class PosteriorAnalyzer:
             bins: number of bins for the histogram
             clip: whether to clip outliers based on percentiles
             clip_bounds: percentiles to clip (low, high), e.g., (1, 99)
+            ax: matplotlib Axes object to plot on (optional)
         """
         if target == "theta_g":
             data = self.theta_g[:, feature_idx]
@@ -323,16 +356,50 @@ class PosteriorAnalyzer:
             lower, upper = np.percentile(data, clip_bounds)
             data = data[(data >= lower) & (data <= upper)]
 
-        plt.figure(figsize=(8, 4))
-        plt.hist(data, bins=bins, color="skyblue", edgecolor="k", alpha=0.7)
-        plt.title(f"Histogram of {label}")
-        plt.xlabel("Value")
-        plt.ylabel("Frequency")
-        plt.grid(True, axis='y', linestyle='--', alpha=0.5)
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 4))
+
+        ax.hist(data, bins=bins, color="skyblue", edgecolor="k", alpha=0.7)
+        ax.set_title(f"Histogram of {label}")
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Frequency")
+        ax.grid(True, axis='y', linestyle='--', alpha=0.5)
+
+        if ax is None:
+            plt.tight_layout()
+            plt.show()
+
+    def plot_timeseries_median(
+        self,
+        target: str = "theta_g",
+        country: Optional[str] = None
+        ):
+        """
+        Args:
+            target: "theta_g" or "theta_l"
+            feature_idx: index of the feature to plot
+            country: required if target is "theta_l
+        """
+        if target == "theta_g":
+            data = self.get_theta_g_median()
+            label = "Posterior Mean of θ_g"
+        elif target == "theta_l":
+            if not country:
+                raise ValueError("Country must be specified when plotting theta_l.")
+            data = self.get_theta_l_median()[country]
+            label = f"Posterior Mean of θ_l[{country}]"
+        else:
+            raise ValueError("target must be 'theta_g' or 'theta_l'")
+        plt.figure(figsize=(10, 5))
+        plt.plot(data, label=label, linewidth=2)
+        plt.title(f"Timeseries of {label}")
+        plt.xlabel("Feature Index")
+        plt.ylabel("Value")
+        plt.grid(True)
+        plt.legend()
         plt.tight_layout()
         plt.show()
-
-    def plot_timeseries(
+    def plot_timeseries_mean(
         self,
         target: str = "theta_g",
         country: Optional[str] = None
@@ -362,6 +429,7 @@ class PosteriorAnalyzer:
         plt.legend()
         plt.tight_layout()
         plt.show()
+        
 
 
 """X = np.random.randn(10, 2)
