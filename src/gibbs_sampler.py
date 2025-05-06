@@ -184,7 +184,7 @@ class HierarchicalGibbsSampler:
 
         rss = 0.5*r.T @ r
         alpha_cond = self.alpha_sigma + self.N/2
-        beta_cond = (rss + self.beta_sigma) 
+        beta_cond = (rss + 1/self.beta_sigma) 
 
         
         tau2 = np.random.gamma(shape=alpha_cond, scale=1/beta_cond)
@@ -204,7 +204,7 @@ class HierarchicalGibbsSampler:
 
             if self.hyper_type == "gamma":
                 alpha_cond = self.alpha_lambda + self.p/2
-                beta_cond = 1/(0.5 * theta_l_c.T @ theta_l_c + self.beta_lambda)
+                beta_cond = 1/(0.5 * theta_l_c.T @ theta_l_c + 1/self.beta_lambda)
 
                 tau2 = np.random.gamma(shape=alpha_cond, scale=beta_cond)
                 self.Lambda[c] = tau2 * self.I
@@ -213,7 +213,7 @@ class HierarchicalGibbsSampler:
             elif self.hyper_type == "wishart":
                 V = inv(self.Sigma) + theta_l_c @ theta_l_c.T
                 inv_V = inv(V)
-                df = self.nu + self.N
+                df = self.nu + 1
                 self.Lambda[c] = wishart.rvs(df=df, scale=inv_V)
 
             else:
@@ -239,7 +239,7 @@ class HierarchicalGibbsSampler:
             self.sample_variance()
             self.sample_hyperparameters()
             #print(self.theta_g[4])
-            print(self.sigma2)
+            #print(self.sigma2)
             #print(self.Lambda["usa"])
             if n >= self.burn_in:
                 self.theta_g_samples.append(self.theta_g)
