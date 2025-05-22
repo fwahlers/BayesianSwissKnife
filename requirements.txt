@@ -1,33 +1,15 @@
-# Core scientific libraries
 numpy
 pandas
 scipy
-
-# Data loading and file handling
-pyarrow                # For efficient .parquet reading
-fastparquet            # Alternative parquet engine (optional, fallback)
-
-# Plotting and visualization
+pyarrow
+fastparquet
 matplotlib
 seaborn
-
-# MCMC diagnostics and plots
-arviz                  # For trace plots, posterior summaries, R-hat, etc.
-
-# Progress bars
+plotly
 tqdm
-
-# Interactive work
-jupyterlab             # or jupyter, based on your preference
-
-# Code structure, utils
-scikit-learn           # For standard scaling, PCA, etc. if needed
-joblib                 # Optional: saving models or cached runs
-
-# Type checking / linting (optional dev tools)
-mypy                   # Static type checker
-black                  # Code formatter
-isort                  # Import sorter
-
-optuna
-scipy.sparse
+jupyterlab
+scikit-learn
+mypy
+black
+isort
+statsmodels
