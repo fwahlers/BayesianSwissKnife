@@ -1,12 +1,8 @@
 # Bachelor Thesis Codebase
 
 This repository contains the code for the empirical and statistical analysis of hierarchical Bayesian models for cross-country financial prediction, specifically for my Bachelor's thesis: 
-"Bayesian Machine Learning: Global Asset Joint Modelling - An MCMC Estimation"
+"Bayesian Multitask Learning for Global Asset Modeling: MCMC Estimation"
 The code is organized in the `src/` directory and is structured for modularity, reproducibility, and ease of experimentation. Dataset is needed on disk. 
-
----
-
-## Directory Structure
 
 ---
 
