@@ -1,7 +1,7 @@
 # Bachelor Thesis Codebase
 
 This repository contains the code for the empirical and statistical analysis of hierarchical Bayesian models for cross-country financial prediction, specifically for my Bachelor's thesis: 
-"Bayesian Multitask Learning for Global Asset Modeling: MCMC Estimation"
+"Bayesian Multitask Learning for Global Asset Modeling: MCMC Estimation".
 The code is organized in the `src/` directory and is structured for modularity, reproducibility, and ease of experimentation. Dataset is needed on disk. 
 
 ---
@@ -16,7 +16,8 @@ The code is organized in the `src/` directory and is structured for modularity, 
 ### `gibbs_sampler.py`
 - **Purpose:** Implements the hierarchical Bayesian Swiss Knife Gibbs sampler.
 - **Key Class:**
-  - `HierarchicalGibbsSampler`: Runs the Gibbs sampling procedure for global and local parameters, supporting both Gamma and Wishart priors.
+  - `HierarchicalGibbsSampler`: Runs the Gibbs sampling procedure for global and local parameters, supporting both Gamma and Wishart priors. Note the could be an improvement in the storing structure of the samples (incremental). 
+
 
 ### `post_analyzer.py`
 - **Purpose:** Provides additional tools for loading, analyzing, and visualizing posterior samples.
